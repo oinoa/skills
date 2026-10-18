@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""OINOA mail: the person's own mailbox over IMAP/SMTP with an app password.
+
+  connect ADDRESS [--provider P] [--chat ID --msg ID]   app password on stdin
+  status | list [N] [--unread] | search WORDS | read ID [--save]
+  reply ID | send TO SUBJECT                            body on stdin
+  disconnect
+
+Python 3 stdlib only. Every answer is a few short lines. A line that starts with
+ERROR names what went wrong and what to tell the person.
+"""
+import argparse
+import email
+import email.policy
+import email.utils
+import imaplib
+import json
+import os
+import re
+import smtplib
+import socket
+import ssl
+import sys
+import urllib.parse
+import urllib.request
+from email.header import decode_header, make_header
+from email.message import EmailMessage
+from html.parser import HTMLParser
+
+HOME = os.path.expanduser("~")
+# ~/.config first; ~/.oinoa-mail when ~/.config is not the agent's own (seen root-owned on client boxes).
+STORES = [os.environ["OINOA_MAIL_DIR"]] if os.environ.get("OINOA_MAIL_DIR") else [
+    os.path.join(HOME, ".config", "oinoa-mail"), os.path.join(HOME, ".oinoa-mail")]
+ACCOUNT = next((os.path.join(d, "account.json") for d in STORES if os.path.exists(os.path.join(d, "account.json"))),
+               os.path.join(STORES[0], "account.json"))
+TG_DIR = os.environ.get("TELEGRAM_STATE_DIR") or os.path.join(HOME, ".claude", "channels", "telegram")
+TG_API = os.environ.get("OINOA_TG_API", "https://api.telegram.org")
+INSECURE = os.environ.get("OINOA_MAIL_INSECURE") == "1"  # plain sockets, tests only
+TIMEOUT = 30
+BODY_LIMIT = 6000
+
+# SMTP on 587 with STARTTLS: many servers block outbound 25 and 465.
+PROVIDERS = {
+    "gmail": ("Gmail", ("imap.gmail.com", 993), ("smtp.gmail.com", 587), "https://myaccount.google.com/apppasswords"),
+    "yandex": ("Yandex", ("imap.yandex.ru", 993), ("smtp.yandex.ru", 587), "https://id.yandex.ru/security/app-passwords"),
+    "mailru": ("Mail.ru", ("imap.mail.ru", 993), ("smtp.mail.ru", 587), "https://account.mail.ru/user/2-step-auth/passwords/"),
+    "icloud": ("iCloud", ("imap.mail.me.com", 993), ("smtp.mail.me.com", 587), "https://account.apple.com"),
+}
+DOMAINS = {
+    "gmail.com": "gmail", "googlemail.com": "gmail",
+    "yandex.ru": "yandex", "ya.ru": "yandex", "yandex.com": "yandex", "yandex.by": "yandex",
+    "yandex.kz": "yandex", "yandex.ua": "yandex", "narod.ru": "yandex",
+    "mail.ru": "mailru", "inbox.ru": "mailru", "list.ru": "mailru", "bk.ru": "mailru", "internet.ru": "mailru",
+    "icloud.com": "icloud", "me.com": "icloud", "mac.com": "icloud",
+}
+MICROSOFT = re.compile(r"^(outlook|hotmail|live|msn|windowslive|passport)\.[a-z.]+$")
+
+
+def out(*lines):
+    print("\n".join(lines))
+
+
+def fail(code, text, extra=()):
+    out(f"ERROR {code}: {text}", *extra)
+    sys.exit(2)
+
+
+def hdr(value):
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(str(value)))).replace("\n", " ").strip()
+    except Exception:
+        return str(value).replace("\n", " ").strip()
+
+
+def tls():
+    return ssl.create_default_context()
+
+
+def hostport(text, default_port):
+    host, _, port = text.partition(":")
+    return (host, int(port) if port else default_port)
+
+
+# ---- the stored account -------------------------------------------------
+
+def load():
+    try:
+        with open(ACCOUNT) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        fail("not_connected", "no mailbox is connected. Offer to connect it (mail skill, Connect), "
+             "or ask them to forward the letter or paste it here.")
+
+
+def save(acct):
+    global ACCOUNT
+    for store in STORES:
+        try:
+            os.makedirs(store, mode=0o700, exist_ok=True)
+            os.chmod(store, 0o700)
+            path = os.path.join(store, "account.json")
+            tmp = path + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(acct, f)
+            os.replace(tmp, path)
+        except OSError:
+            continue
+        for other in STORES:  # one mailbox per agent: drop a copy left in the other place
+            stale = os.path.join(other, "account.json")
+            if other != store and os.path.exists(stale):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+        ACCOUNT = path
+        return
+    fail("cannot_save", "the mailbox works, but it could not be kept on this agent. Nothing is stored; "
+         "tell them it will be fixed and to forward or paste the letter meanwhile.")
+
+
+# ---- servers --------------------------------------------------------------
+
+def imap_open(acct, user=None):
+    host, port = acct["imap"]
+    if port == 993 and not INSECURE:
+        m = imaplib.IMAP4_SSL(host, port, ssl_context=tls(), timeout=TIMEOUT)
+    else:
+        m = imaplib.IMAP4(host, port, timeout=TIMEOUT)
+        if not INSECURE:
+            m.starttls(ssl_context=tls())
+    m.login(user or acct.get("user") or acct["address"], acct["password"])
+    return m
+
+
+def smtp_open(acct):
+    host, port = acct["smtp"]
+    if port == 465 and not INSECURE:
+        s = smtplib.SMTP_SSL(host, port, context=tls(), timeout=TIMEOUT)
+    else:
+        s = smtplib.SMTP(host, port, timeout=TIMEOUT)
+        s.ehlo()
+        if not INSECURE:
+            s.starttls(context=tls())
+            s.ehlo()
+    s.login(acct.get("user") or acct["address"], acct["password"])
+    return s
+
+
+def mailbox(acct):
+    try:
+        m = imap_open(acct)
+        m.select("INBOX", readonly=True)
+        return m
+    except (OSError, imaplib.IMAP4.error) as e:
+        fail("server", f"the mailbox did not answer ({short(e)}). Try again in a minute; "
+             "if it keeps failing, connect it again with a new app password.")
+
+
+def short(e):
+    text = e.args[0] if getattr(e, "args", None) else e
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    return str(text)[:160]
+
+
+# ---- Telegram: the message with the password leaves the chat ------------
+
+def forget_message(chat, msg, secrets):
+    deleted = False
+    token = ""
+    try:
+        with open(os.path.join(TG_DIR, ".env")) as f:
+            for line in f:
+                if line.startswith("TELEGRAM_BOT_TOKEN="):
+                    token = line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    if token and chat and msg:
+        try:
+            data = urllib.parse.urlencode({"chat_id": chat, "message_id": msg}).encode()
+            with urllib.request.urlopen(f"{TG_API}/bot{token}/deleteMessage", data, timeout=15) as r:
+                deleted = json.load(r).get("ok") is True
+        except Exception:
+            deleted = False
+    scrub_log(str(msg or ""), [s for s in secrets if len(s) >= 8])
+    if deleted:
+        return "Chat: the message with the password is deleted."
+    return "Chat: could not delete the message with the password. Ask them to delete it now."
+
+
+def scrub_log(msg, secrets):
+    logdir = os.path.join(TG_DIR, "msglog")
+    try:
+        names = [n for n in os.listdir(logdir) if n.endswith(".jsonl")]
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(logdir, name)
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        changed = False
+        for i, line in enumerate(lines):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            text = str(row.get("text", ""))
+            hit = (msg and str(row.get("message_id")) == msg and row.get("dir") == "in")
+            hit = hit or any(s in text for s in secrets)
+            if hit:
+                row["text"] = "[deleted: mail password]"
+                lines[i] = json.dumps(row, ensure_ascii=False) + "\n"
+                changed = True
+        if changed:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                f.writelines(lines)
+            os.chmod(tmp, os.stat(path).st_mode & 0o777)
+            os.replace(tmp, path)
+
+
+# ---- commands --------------------------------------------------------------
+
+def cmd_connect(a):
+    raw = "" if sys.stdin.isatty() else sys.stdin.read()
+    address = a.address.strip().lower()
+    domain = address.rpartition("@")[2]
+    provider = a.provider or DOMAINS.get(domain, "")
+    password = raw.strip()
+    if provider == "gmail":
+        joined = re.sub(r"\s+", "", password)
+        found = re.search(r"(?<![A-Za-z])[A-Za-z]{4}(?:\s?[A-Za-z]{4}){3}(?![A-Za-z])", password)
+        if re.fullmatch(r"[A-Za-z]{16}", joined):
+            password = joined
+        elif found:
+            password = re.sub(r"\s+", "", found.group(0))
+    note = forget_message(a.chat, a.msg, [raw.strip(), password]) if (a.chat or a.msg or raw) else ""
+    tail = [note] if note else []
+
+    if "@" not in address:
+        fail("bad_address", "that is not an email address. Ask for the full address.", tail)
+    if MICROSOFT.match(domain):
+        fail("outlook_not_yet", "Outlook cannot be connected yet. Ask them to forward the letter or paste it here.", tail)
+    if not provider and not (a.imap and a.smtp):
+        fail("unknown_provider", "ask where this mail lives: Gmail (Google Workspace), Yandex, Mail.ru or iCloud. "
+             "Then run connect again with --provider gmail|yandex|mailru|icloud.", tail)
+    if not password:
+        fail("no_password", "no app password came in on stdin. Run connect with the password in the <<'EOF' block.", tail)
+
+    name, imap, smtp, revoke = PROVIDERS.get(provider, ("the mailbox", None, None, ""))
+    acct = {
+        "address": address, "provider": provider or "custom", "name": name,
+        "imap": list(hostport(a.imap, 993) if a.imap else imap),
+        "smtp": list(hostport(a.smtp, 587) if a.smtp else smtp),
+        "password": password, "revoke": revoke,
+    }
+    users = [address] + ([address.split("@")[0]] if provider == "icloud" else [])
+    m, err = None, None
+    for user in users:
+        try:
+            m = imap_open(acct, user)
+            acct["user"] = user
+            break
+        except imaplib.IMAP4.error as e:
+            err = short(e)
+        except OSError as e:
+            fail("server", f"could not reach {name} ({short(e)}). Try again in a minute.", tail)
+    if m is None:
+        if "application-specific password" in err.lower() or "webalert" in err.lower():
+            fail("app_password_needed", "that is their main password, not an app password. "
+                 f"The app password comes from {revoke} and needs 2-Step Verification on.", tail)
+        hint = " In Yandex Mail settings, Mail clients, IMAP must be on." if provider == "yandex" else ""
+        fail("login_failed", f"{name} did not accept the password. Ask them to create a new app password"
+             f"{' at ' + revoke if revoke else ''} and send it.{hint}", tail)
+    total = unseen = "?"
+    try:
+        typ, data = m.status("INBOX", "(MESSAGES UNSEEN)")
+        found = re.search(rb"MESSAGES (\d+).*UNSEEN (\d+)", data[0] or b"")
+        if found:
+            total, unseen = found.group(1).decode(), found.group(2).decode()
+        m.logout()
+    except (OSError, imaplib.IMAP4.error):
+        pass
+    try:
+        smtp_open(acct).quit()
+        sending = "Sending: works."
+    except (OSError, smtplib.SMTPException) as e:
+        sending = f"Sending: not available ({short(e)}). Reading works."
+    before = ""
+    if os.path.exists(ACCOUNT):
+        try:
+            with open(ACCOUNT) as f:
+                old = json.load(f).get("address", "")
+            if old and old != address:
+                before = f" It replaces {old}."
+        except (OSError, ValueError):
+            pass
+    save(acct)
+    out(f"OK connected {address} ({name}). Inbox: {total} letters, {unseen} unread.{before}", sending, *tail)
+
+
+def cmd_status(a):
+    if not os.path.exists(ACCOUNT):
+        out("Not connected.")
+        return
+    acct = load()
+    out(f"Connected: {acct['address']} ({acct.get('name', 'mail')}).")
+
+
+def headers_for(m, uids):
+    if not uids:
+        return []
+    typ, data = m.uid("fetch", b",".join(uids), "(UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+    rows = []
+    for item in data:
+        if not isinstance(item, tuple):
+            continue
+        meta = item[0].decode("utf-8", "replace")
+        uid = re.search(r"UID (\d+)", meta)
+        if not uid:
+            continue
+        msg = email.message_from_bytes(item[1], policy=email.policy.compat32)
+        name, addr = email.utils.parseaddr(hdr(msg.get("From")))
+        when = ""
+        try:
+            when = email.utils.parsedate_to_datetime(msg.get("Date")).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+        new = "" if "\\Seen" in meta else " | unread"
+        rows.append((int(uid.group(1)), f"{uid.group(1)} | {when} | {name or addr} | {hdr(msg.get('Subject')) or '(no subject)'}{new}"))
+    return [line for _, line in sorted(rows, reverse=True)]
+
+
+def cmd_list(a):
+    acct = load()
+    m = mailbox(acct)
+    typ, data = m.uid("search", None, "UNSEEN" if a.unread else "ALL")
+    uids = data[0].split()
+    n = max(1, min(a.n, 50))
+    rows = headers_for(m, uids[-n:])
+    m.logout()
+    if not rows:
+        out("No unread letters." if a.unread else "The inbox is empty.")
+        return
+    kind = "unread" if a.unread else "newest"
+    out(f"Inbox {acct['address']}: {len(rows)} {kind} of {len(uids)}. ID | date | from | subject", *rows)
+
+
+def cmd_search(a):
+    acct = load()
+    m = mailbox(acct)
+    q = " ".join(a.words).strip()
+    if not q:
+        fail("no_words", "say what to search for.")
+    # One key per search, merged: some servers match Cyrillic in FROM and SUBJECT but not in TEXT.
+    found = set()
+    for key in ("FROM", "SUBJECT", "TEXT"):
+        try:
+            if q.isascii():
+                quoted = '"' + q.replace("\\", "\\\\").replace('"', '\\"') + '"'
+                typ, data = m.uid("search", None, key, quoted)
+            else:
+                m.literal = q.encode("utf-8")
+                typ, data = m.uid("search", "CHARSET", "UTF-8", key)
+            found.update(data[0].split())
+        except imaplib.IMAP4.error:
+            continue
+    uids = sorted(found, key=int)
+    rows = headers_for(m, uids[-10:])
+    m.logout()
+    if not rows:
+        out(f"Nothing in the inbox matches: {q}")
+        return
+    out(f"Found {len(uids)}, newest {len(rows)}. ID | date | from | subject", *rows)
+
+
+class _Text(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts, self.skip = [], 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "head"):
+            self.skip += 1
+        if tag in ("br", "p", "div", "tr", "li", "h1", "h2", "h3", "table"):
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "head") and self.skip:
+            self.skip -= 1
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.parts.append(data)
+
+
+def text_of(part):
+    try:
+        body = part.get_content()
+    except Exception:
+        body = (part.get_payload(decode=True) or b"").decode("utf-8", "replace")
+    if part.get_content_type() == "text/html":
+        p = _Text()
+        p.feed(body)
+        body = "".join(p.parts)
+    body = re.sub(r"[ \t\r\f\v]+\n", "\n", body)
+    return re.sub(r"\n{3,}", "\n\n", body).strip()
+
+
+def fetch(m, uid):
+    if not uid.isdigit():
+        fail("bad_id", "the ID is the number at the start of a line from list or search.")
+    typ, data = m.uid("fetch", uid, "(BODY.PEEK[])")
+    raw = next((item[1] for item in data if isinstance(item, tuple)), None)
+    if raw is None:
+        fail("not_found", f"no letter with ID {uid} in the inbox. Run list or search again.")
+    return email.message_from_bytes(raw, policy=email.policy.default)
+
+
+def cmd_read(a):
+    acct = load()
+    m = mailbox(acct)
+    msg = fetch(m, a.id)
+    m.logout()
+    lines = [f"From: {hdr(msg['From'])}", f"To: {hdr(msg['To'])}"]
+    if msg["Cc"]:
+        lines.append(f"Cc: {hdr(msg['Cc'])}")
+    lines += [f"Date: {hdr(msg['Date'])}", f"Subject: {hdr(msg['Subject'])}", ""]
+    part = msg.get_body(preferencelist=("plain", "html"))
+    body = text_of(part) if part is not None else ""
+    if len(body) > BODY_LIMIT:
+        body = body[:BODY_LIMIT] + f"\n[... {len(body) - BODY_LIMIT} more characters cut]"
+    lines.append(body or "(no text)")
+    files = list(msg.iter_attachments())
+    if files:
+        lines.append("")
+        folder = os.path.join(HOME, "mail", a.id)
+        for i, f in enumerate(files, 1):
+            fname = os.path.basename(hdr(f.get_filename()) or f"attachment-{i}") or f"attachment-{i}"
+            payload = f.get_payload(decode=True) or b""
+            if a.save:
+                os.makedirs(folder, exist_ok=True)
+                path = os.path.join(folder, fname)
+                with open(path, "wb") as fh:
+                    fh.write(payload)
+                lines.append(f"Attachment saved: {path}")
+            else:
+                lines.append(f"Attachment: {fname} ({len(payload) // 1024 + 1} KB). read {a.id} --save keeps it.")
+    out(*lines)
+
+
+def deliver(acct, to, subject, body, extra=None):
+    msg = EmailMessage()
+    msg["From"] = acct["address"]
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg["Date"] = email.utils.formatdate(localtime=True)
+    msg["Message-ID"] = email.utils.make_msgid(domain=acct["address"].rpartition("@")[2])
+    for key, value in (extra or {}).items():
+        if value:
+            msg[key] = value
+    msg.set_content(body)
+    try:
+        s = smtp_open(acct)
+        s.send_message(msg)
+        s.quit()
+    except (OSError, smtplib.SMTPException) as e:
+        fail("not_sent", f"the letter was not sent ({short(e)}). Nothing left the mailbox.")
+    out(f"OK sent to {to}: {subject}")
+
+
+def body_from_stdin():
+    body = "" if sys.stdin.isatty() else sys.stdin.read().strip()
+    if not body:
+        fail("no_text", "the letter text goes in the <<'EOF' block.")
+    return body + "\n"
+
+
+def cmd_reply(a):
+    acct = load()
+    body = body_from_stdin()
+    m = mailbox(acct)
+    orig = fetch(m, a.id)
+    m.logout()
+    to = hdr(orig["Reply-To"]) or hdr(orig["From"])
+    subject = hdr(orig["Subject"])
+    if not re.match(r"(?i)^(re|ответ)\s*:", subject):
+        subject = "Re: " + subject
+    ref = orig["Message-ID"]
+    refs = " ".join(x for x in (hdr(orig["References"]), ref) if x)
+    deliver(acct, to, subject, body, {"In-Reply-To": ref, "References": refs})
+
+
+def cmd_send(a):
+    acct = load()
+    if "@" not in a.to:
+        fail("bad_address", "the first word after send is the address.")
+    deliver(acct, a.to, a.subject, body_from_stdin())
+
+
+def cmd_disconnect(a):
+    if not os.path.exists(ACCOUNT):
+        out("Not connected.")
+        return
+    acct = load()
+    os.remove(ACCOUNT)
+    revoke = acct.get("revoke")
+    out(f"OK disconnected {acct['address']}. This agent can no longer read it.",
+        *([f"To switch the password off everywhere, they remove it here: {revoke}"] if revoke else []))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="mail.py", description="The person's own mailbox.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("connect")
+    c.add_argument("address")
+    c.add_argument("--provider", choices=sorted(PROVIDERS))
+    c.add_argument("--chat", help="chat_id of the message with the password")
+    c.add_argument("--msg", help="message_id of the message with the password")
+    c.add_argument("--imap", help="host[:port], a mailbox outside the known providers")
+    c.add_argument("--smtp", help="host[:port]")
+    sub.add_parser("status")
+    ls = sub.add_parser("list")
+    ls.add_argument("n", nargs="?", type=int, default=10)
+    ls.add_argument("--unread", action="store_true")
+    s = sub.add_parser("search")
+    s.add_argument("words", nargs="+")
+    r = sub.add_parser("read")
+    r.add_argument("id")
+    r.add_argument("--save", action="store_true")
+    rp = sub.add_parser("reply")
+    rp.add_argument("id")
+    sd = sub.add_parser("send")
+    sd.add_argument("to")
+    sd.add_argument("subject")
+    sub.add_parser("disconnect")
+    a = p.parse_args()
+    socket.setdefaulttimeout(TIMEOUT)
+    {"connect": cmd_connect, "status": cmd_status, "list": cmd_list, "search": cmd_search,
+     "read": cmd_read, "reply": cmd_reply, "send": cmd_send, "disconnect": cmd_disconnect}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()
