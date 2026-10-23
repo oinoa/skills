@@ -154,9 +154,11 @@ def mailbox(acct):
         m = imap_open(acct)
         m.select("INBOX", readonly=True)
         return m
-    except (OSError, imaplib.IMAP4.error) as e:
-        fail("server", f"the mailbox did not answer ({short(e)}). Try again in a minute; "
-             "if it keeps failing, connect it again with a new app password.")
+    except OSError as e:  # a timeout or a refused connection is the server or the network, never the password
+        fail("server", f"the mail server did not answer ({short(e)}). That is the server or the network, not the password: "
+             "try again later, and do not ask the person for a new password because of it.")
+    except imaplib.IMAP4.error as e:
+        fail("refused", f"the mailbox refused ({short(e)}). If it keeps refusing, connect it again with a new app password.")
 
 
 def short(e):
@@ -470,8 +472,13 @@ def deliver(acct, to, subject, body, extra=None):
         s = smtp_open(acct)
         s.send_message(msg)
         s.quit()
-    except (OSError, smtplib.SMTPException) as e:
+    except smtplib.SMTPAuthenticationError as e:
+        fail("not_sent", f"the letter was not sent: the mailbox refused the login ({short(e)}). Connect it again with a new app password.")
+    except smtplib.SMTPException as e:  # an OSError too, so before the network case
         fail("not_sent", f"the letter was not sent ({short(e)}). Nothing left the mailbox.")
+    except OSError as e:
+        fail("not_sent", f"the letter was not sent: the mail server did not answer ({short(e)}). That is the server or the network, "
+             "not the password; nothing left the mailbox. Try again later.")
     out(f"OK sent to {to}: {subject}")
 
 
