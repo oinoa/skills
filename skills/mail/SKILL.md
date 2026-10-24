@@ -4,7 +4,8 @@ description: >-
   Connect the person's own mailbox (Gmail, Yandex, Mail.ru, iCloud) right here in the chat,
   then list, search, read, reply to and send their mail. Use for "connect my mail",
   "подключи почту", "what's new in my inbox", "find the letter from…", "answer Ivan",
-  "disconnect my mail". Outlook and calendars cannot be connected yet.
+  "disconnect my mail". Outlook cannot be connected yet. Calendars are not connected here:
+  Yandex Calendar is connected in Настройки → Инструменты, then read with business-apps.
 compatibility: "python3. Gmail needs 2-Step Verification on for an app password."
 metadata:
   author: OINOA
@@ -66,4 +67,6 @@ work admin switched app passwords off. Until that changes, they forward or paste
 - Disconnect: run it, then give them the link from its answer to switch the password off.
 - Not connected and they ask about their mail: offer to connect it, or ask them to forward
   or paste the letter.
-- Calendar cannot be connected yet. An invitation that arrives by mail you read like any letter.
+- Calendars are not connected here. Yandex Calendar (and Bitrix24's) the person connects in
+  Настройки → Инструменты, then use **business-apps**; Google and Outlook calendars cannot be
+  connected yet. An invitation that arrives by mail you read like any letter.
