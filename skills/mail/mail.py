@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""OINOA mail: the person's own mailbox over IMAP/SMTP with an app password.
+"""OINOA mail: the person's own mailbox over IMAP/SMTP with an app password, or Microsoft's sign-in for Outlook.
 
-  connect ADDRESS [--provider P] [--chat ID --msg ID]   app password on stdin
+  connect ADDRESS [--provider P] [--chat ID --msg ID]   app password on stdin (Outlook: none, it prints a code)
+  finish                                                Outlook: after they entered the code at Microsoft
   status | list [N] [--unread] | search WORDS | read ID [--save]
   reply ID | send TO SUBJECT                            body on stdin
   disconnect
@@ -10,6 +11,7 @@ Python 3 stdlib only. Every answer is a few short lines. A line that starts with
 ERROR names what went wrong and what to tell the person.
 """
 import argparse
+import base64
 import email
 import email.policy
 import email.utils
@@ -21,6 +23,8 @@ import smtplib
 import socket
 import ssl
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from email.header import decode_header, make_header
@@ -54,6 +58,16 @@ DOMAINS = {
     "icloud.com": "icloud", "me.com": "icloud", "mac.com": "icloud",
 }
 MICROSOFT = re.compile(r"^(outlook|hotmail|live|msn|windowslive|passport)\.[a-z.]+$")
+
+# DIVE-7145: Outlook.com and Microsoft 365 by Microsoft's own sign-in, never a password in the chat: OINOA's Entra app (a public
+# client, so its id is no secret) and the device-code flow. They open the link, type the code, sign in and allow OINOA; the
+# agent then reads and sends over IMAP/SMTP with the token (XOAUTH2). No app id yet: Outlook stays "not yet", as before.
+MS_CLIENT_ID = os.environ.get("OINOA_MS_CLIENT_ID", "")
+MS_AUTHORITY = os.environ.get("OINOA_MS_AUTHORITY", "https://login.microsoftonline.com/common").rstrip("/")
+MS_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send offline_access openid email"
+PROVIDERS["outlook"] = ("Outlook", ("outlook.office365.com", 993), ("smtp-mail.outlook.com", 587), "https://account.live.com/consent/Manage")
+PROVIDERS["microsoft365"] = ("Microsoft 365", ("outlook.office365.com", 993), ("smtp.office365.com", 587), "https://myapps.microsoft.com")
+OAUTH = ("outlook", "microsoft365")
 
 
 def out(*lines):
@@ -121,6 +135,72 @@ def save(acct):
          "tell them it will be fixed and to forward or paste the letter meanwhile.")
 
 
+# ---- Microsoft sign-in ------------------------------------------------------
+
+def ms_post(path, fields):
+    """-> (json, error code or None). Microsoft answers an OAuth error as 400 with {"error": ...}."""
+    data = urllib.parse.urlencode(fields).encode()
+    try:
+        with urllib.request.urlopen(f"{MS_AUTHORITY}/oauth2/v2.0/{path}", data, timeout=TIMEOUT) as r:
+            return json.load(r), None
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.load(e)
+        except ValueError:
+            body = {}
+        return body, str(body.get("error") or f"http_{e.code}")
+    except (OSError, ValueError) as e:
+        fail("server", f"Microsoft's sign-in did not answer ({short(e)}). Try again in a minute.")
+
+
+def ms_token(acct):
+    """A live access token for this mailbox: the kept one, or a new one from the refresh token (kept again)."""
+    o = acct["oauth"]
+    if o.get("access_token") and o.get("expires_at", 0) - 120 > time.time():
+        return o["access_token"]
+    body, err = ms_post("token", {"client_id": o["client_id"], "grant_type": "refresh_token",
+                                  "refresh_token": o["refresh_token"], "scope": MS_SCOPE})
+    if err:
+        fail("signin_expired", f"Microsoft wants them to sign in again ({err}). Run connect again: it gives a new code, "
+             "no password.")
+    o["access_token"] = body["access_token"]
+    o["expires_at"] = int(time.time()) + int(body.get("expires_in", 3600))
+    if body.get("refresh_token"):
+        o["refresh_token"] = body["refresh_token"]
+    if os.path.exists(ACCOUNT):
+        save(acct)
+    return o["access_token"]
+
+
+def pending_path():
+    """Where the waiting sign-in is: the store that has one, else the first one this agent can write."""
+    for store in STORES:
+        if os.path.exists(os.path.join(store, "pending.json")):
+            return os.path.join(store, "pending.json")
+    for store in STORES:
+        try:
+            os.makedirs(store, mode=0o700, exist_ok=True)
+            if os.access(store, os.W_OK):
+                return os.path.join(store, "pending.json")
+        except OSError:
+            continue
+    fail("cannot_save", "the sign-in could not be kept on this agent. Tell them it will be fixed and to forward the letter meanwhile.")
+
+
+def xoauth2(user, token):
+    return f"user={user}\x01auth=Bearer {token}\x01\x01"
+
+
+def signed_in_as(body):
+    """The address Microsoft signed them in with, from the id_token (only read, never trusted for access)."""
+    try:
+        part = body.get("id_token", "").split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+        return str(claims.get("preferred_username") or claims.get("email") or "").lower()
+    except (IndexError, ValueError):
+        return ""
+
+
 # ---- servers --------------------------------------------------------------
 
 def imap_open(acct, user=None):
@@ -131,7 +211,11 @@ def imap_open(acct, user=None):
         m = imaplib.IMAP4(host, port, timeout=TIMEOUT)
         if not INSECURE:
             m.starttls(ssl_context=tls())
-    m.login(user or acct.get("user") or acct["address"], acct["password"])
+    if acct.get("oauth"):
+        auth = xoauth2(user or acct.get("user") or acct["address"], ms_token(acct))
+        m.authenticate("XOAUTH2", lambda _: auth.encode())
+    else:
+        m.login(user or acct.get("user") or acct["address"], acct["password"])
     return m
 
 
@@ -145,7 +229,11 @@ def smtp_open(acct):
         if not INSECURE:
             s.starttls(context=tls())
             s.ehlo()
-    s.login(acct.get("user") or acct["address"], acct["password"])
+    if acct.get("oauth"):
+        auth = xoauth2(acct.get("user") or acct["address"], ms_token(acct))
+        s.auth("XOAUTH2", lambda challenge=None: auth if challenge is None else "")
+    else:
+        s.login(acct.get("user") or acct["address"], acct["password"])
     return s
 
 
@@ -158,6 +246,8 @@ def mailbox(acct):
         fail("server", f"the mail server did not answer ({short(e)}). That is the server or the network, not the password: "
              "try again later, and do not ask the person for a new password because of it.")
     except imaplib.IMAP4.error as e:
+        if acct.get("oauth"):
+            fail("refused", f"the mailbox refused Microsoft's sign-in ({short(e)}). Run connect again: a new code, no password.")
         fail("refused", f"the mailbox refused ({short(e)}). If it keeps refusing, connect it again with a new app password.")
 
 
@@ -247,11 +337,13 @@ def cmd_connect(a):
 
     if "@" not in address:
         fail("bad_address", "that is not an email address. Ask for the full address.", tail)
-    if MICROSOFT.match(domain):
-        fail("outlook_not_yet", "Outlook cannot be connected yet. Ask them to forward the letter or paste it here.", tail)
+    if MICROSOFT.match(domain) and provider not in OAUTH:
+        provider = "outlook"
+    if provider in OAUTH:
+        return ms_start(address, provider, tail)
     if not provider and not (a.imap and a.smtp):
-        fail("unknown_provider", "ask where this mail lives: Gmail (Google Workspace), Yandex, Mail.ru or iCloud. "
-             "Then run connect again with --provider gmail|yandex|mailru|icloud.", tail)
+        fail("unknown_provider", "ask where this mail lives: Gmail (Google Workspace), Yandex, Mail.ru, iCloud, or Outlook / "
+             "Microsoft 365. Then run connect again with --provider gmail|yandex|mailru|icloud|outlook|microsoft365.", tail)
     if not password:
         fail("no_password", "no app password came in on stdin. Run connect with the password in the <<'EOF' block.", tail)
 
@@ -305,6 +397,102 @@ def cmd_connect(a):
             pass
     save(acct)
     out(f"OK connected {address} ({name}). Inbox: {total} letters, {unseen} unread.{before}", sending, *tail)
+
+
+def ms_start(address, provider, tail):
+    """Outlook / Microsoft 365, step 1: Microsoft's code for them to enter; the waiting sign-in is kept for finish."""
+    if not MS_CLIENT_ID:
+        fail("outlook_not_yet", "Outlook cannot be connected yet. Ask them to forward the letter or paste it here.", tail)
+    body, err = ms_post("devicecode", {"client_id": MS_CLIENT_ID, "scope": MS_SCOPE})
+    if err:
+        fail("server", f"Microsoft did not start the sign-in ({err}). Try again in a minute.", tail)
+    pending = {"address": address, "provider": provider, "device_code": body["device_code"], "client_id": MS_CLIENT_ID,
+               "interval": int(body.get("interval", 5)), "expires_at": int(time.time()) + int(body.get("expires_in", 900))}
+    path = pending_path()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(pending, f)
+    link, code, mins = body.get("verification_uri", "https://microsoft.com/devicelogin"), body["user_code"], int(body.get("expires_in", 900)) // 60
+    out(f"OK sign-in started for {address}. Send them, in one message: open {link}, enter the code {code}, sign in as "
+        f"{address} and allow OINOA. No password in this chat. The code works for {mins} minutes.",
+        "When they say it is done, run: mail.py finish", *tail)
+
+
+def cmd_finish(a):
+    """Outlook / Microsoft 365, step 2: wait up to about 90 s for their sign-in, then check the mailbox and keep it."""
+    path = pending_path()
+    try:
+        with open(path) as f:
+            p = json.load(f)
+    except (OSError, ValueError):
+        fail("no_signin", "no Microsoft sign-in is waiting. Run connect with their address first.")
+    interval, deadline = max(1, p.get("interval", 5)), min(p["expires_at"], time.time() + 90)
+    while True:
+        body, err = ms_post("token", {"client_id": p["client_id"], "device_code": p["device_code"],
+                                      "grant_type": "urn:ietf:params:oauth:grant-type:device_code"})
+        if not err:
+            break
+        if err in ("authorization_pending", "slow_down"):
+            interval += 5 if err == "slow_down" else 0
+            if time.time() + interval > deadline:
+                if time.time() + interval > p["expires_at"]:
+                    os.remove(path)
+                    fail("expired", "the code expired before they signed in. Run connect again for a new code.")
+                out("PENDING: they have not finished signing in at Microsoft yet. Ask them to finish, then run finish again.")
+                return
+            time.sleep(interval)
+            continue
+        os.remove(path)
+        if err in ("authorization_declined", "access_denied"):
+            fail("declined", "they did not allow OINOA at Microsoft. Nothing is connected. Run connect again if they want to.")
+        if err == "expired_token":
+            fail("expired", "the code expired before they signed in. Run connect again for a new code.")
+        fail("signin_failed", f"Microsoft did not finish the sign-in ({err}). Run connect again for a new code.")
+    os.remove(path)
+    address, provider = p["address"], p["provider"]
+    who, other = signed_in_as(body), ""
+    if "@" in who and who != address:  # the mailbox is the account they signed in with (a work alias resolves to it too)
+        other = (f"They signed in at Microsoft as {who}, so that is the mailbox connected, not {address}. If it is the wrong one, "
+                 "run connect again and ask them to sign in with the right account.")
+        address = who
+    name, imap, smtp, revoke = PROVIDERS[provider]
+    acct = {"address": address, "provider": provider, "name": name, "imap": list(imap), "smtp": list(smtp), "revoke": revoke,
+            "oauth": {"client_id": p["client_id"], "refresh_token": body.get("refresh_token", ""),
+                      "access_token": body["access_token"],
+                      "expires_at": int(time.time()) + int(body.get("expires_in", 3600))}}
+    try:
+        m = imap_open(acct)
+    except imaplib.IMAP4.error as e:
+        fail("login_failed", f"{name} did not let the sign-in read the mailbox ({short(e)}). A work account may need its "
+             "administrator to allow IMAP for it. Ask them to forward the letter meanwhile.")
+    except OSError as e:
+        fail("server", f"could not reach {name} ({short(e)}). Run connect again in a minute.")
+    total = unseen = "?"
+    try:
+        typ, data = m.status("INBOX", "(MESSAGES UNSEEN)")
+        found = re.search(rb"MESSAGES (\d+).*UNSEEN (\d+)", data[0] or b"")
+        if found:
+            total, unseen = found.group(1).decode(), found.group(2).decode()
+        m.logout()
+    except (OSError, imaplib.IMAP4.error):
+        pass
+    try:
+        smtp_open(acct).quit()
+        sending = "Sending: works."
+    except (OSError, smtplib.SMTPException) as e:
+        sending = (f"Sending: not available ({short(e)}). Reading works. A work account may need its administrator to "
+                   "allow SMTP sending for this mailbox.")
+    before = ""
+    if os.path.exists(ACCOUNT):
+        try:
+            with open(ACCOUNT) as f:
+                old = json.load(f).get("address", "")
+            if old and old != address:
+                before = f" It replaces {old}."
+        except (OSError, ValueError):
+            pass
+    save(acct)
+    out(f"OK connected {address} ({name}). Inbox: {total} letters, {unseen} unread.{before}", sending, *([other] if other else []))
 
 
 def cmd_status(a):
@@ -473,7 +661,8 @@ def deliver(acct, to, subject, body, extra=None):
         s.send_message(msg)
         s.quit()
     except smtplib.SMTPAuthenticationError as e:
-        fail("not_sent", f"the letter was not sent: the mailbox refused the login ({short(e)}). Connect it again with a new app password.")
+        fail("not_sent", f"the letter was not sent: the mailbox refused the login ({short(e)}). "
+             + ("Run connect again: a new Microsoft code, no password." if acct.get("oauth") else "Connect it again with a new app password."))
     except smtplib.SMTPException as e:  # an OSError too, so before the network case
         fail("not_sent", f"the letter was not sent ({short(e)}). Nothing left the mailbox.")
     except OSError as e:
@@ -518,8 +707,9 @@ def cmd_disconnect(a):
     acct = load()
     os.remove(ACCOUNT)
     revoke = acct.get("revoke")
+    off = "OINOA's access" if acct.get("oauth") else "the password"
     out(f"OK disconnected {acct['address']}. This agent can no longer read it.",
-        *([f"To switch the password off everywhere, they remove it here: {revoke}"] if revoke else []))
+        *([f"To switch {off} off everywhere, they remove it here: {revoke}"] if revoke else []))
 
 
 def main():
@@ -532,6 +722,7 @@ def main():
     c.add_argument("--msg", help="message_id of the message with the password")
     c.add_argument("--imap", help="host[:port], a mailbox outside the known providers")
     c.add_argument("--smtp", help="host[:port]")
+    sub.add_parser("finish")
     sub.add_parser("status")
     ls = sub.add_parser("list")
     ls.add_argument("n", nargs="?", type=int, default=10)
@@ -549,7 +740,7 @@ def main():
     sub.add_parser("disconnect")
     a = p.parse_args()
     socket.setdefaulttimeout(TIMEOUT)
-    {"connect": cmd_connect, "status": cmd_status, "list": cmd_list, "search": cmd_search,
+    {"connect": cmd_connect, "finish": cmd_finish, "status": cmd_status, "list": cmd_list, "search": cmd_search,
      "read": cmd_read, "reply": cmd_reply, "send": cmd_send, "disconnect": cmd_disconnect}[a.cmd](a)
 
 

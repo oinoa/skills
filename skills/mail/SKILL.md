@@ -1,10 +1,10 @@
 ---
 name: mail
 description: >-
-  Connect the person's own mailbox (Gmail, Yandex, Mail.ru, iCloud) right here in the chat,
+  Connect the person's own mailbox (Gmail, Yandex, Mail.ru, iCloud, Outlook / Microsoft 365) right here in the chat,
   then list, search, read, reply to and send their mail. Use for "connect my mail",
   "подключи почту", "what's new in my inbox", "find the letter from…", "answer Ivan",
-  "disconnect my mail". Outlook cannot be connected yet. Calendars are not connected here:
+  "disconnect my mail". Outlook signs in at Microsoft with a code, no password. Calendars are not connected here:
   Yandex Calendar is connected in Настройки → Инструменты, then read with business-apps.
 compatibility: "python3. Gmail needs 2-Step Verification on for an app password."
 metadata:
@@ -19,8 +19,8 @@ A line that starts with `ERROR` says what to tell the person. Say it in your own
 
 ## Connect, in this chat
 
-1. Get the address. Outlook, Hotmail, Live or a Microsoft work address: say Outlook cannot
-   be connected yet, and ask them to forward the letter or paste it here. Stop.
+1. Get the address. Outlook, Hotmail, Live, or a work address on Microsoft 365: go to
+   **Outlook** below. Never ask for a password there.
 2. Send the steps for their mail in one short message, in their language:
    - Gmail: turn on 2-Step Verification, open https://myaccount.google.com/apppasswords,
      type OINOA as the name, tap Create, send me the 16 letters.
@@ -43,6 +43,22 @@ A line that starts with `ERROR` says what to tell the person. Say it in your own
 5. Tell them the mailbox is connected, with the count it gives. Never repeat the password
    or write it anywhere else. Never ask for their main password.
 
+### Outlook and Microsoft 365: Microsoft's sign-in, no password
+
+1. Run (a work address on Microsoft 365: add `--provider microsoft365`):
+
+       python3 ~/.claude/skills/mail/mail.py connect ADDRESS
+
+2. It answers with a link and a code. Send them both in one message, in their language: open
+   the link, type the code, sign in with that address and allow OINOA.
+   `ERROR outlook_not_yet`: say Outlook cannot be connected yet, and ask them to forward the
+   letter or paste it here. Stop.
+3. They say it is done: run `python3 ~/.claude/skills/mail/mail.py finish`.
+   `PENDING`: ask them to finish at Microsoft, then run finish again. `ERROR expired` or
+   `declined`: offer a new code (connect again).
+4. Tell them the mailbox is connected, with the count it gives. A work mailbox whose sending is
+   off: reading works; their administrator can allow sending (SMTP) for it.
+
 Gmail says the app password page is not available: 2-Step Verification is off, or their
 work admin switched app passwords off. Until that changes, they forward or paste.
 
@@ -64,7 +80,7 @@ work admin switched app passwords off. Until that changes, they forward or paste
 - Reading never marks a letter as read.
 - reply and send only after a clear yes to that exact text.
 - Report what matters, not the raw list: who wrote, what they want, by when.
-- Disconnect: run it, then give them the link from its answer to switch the password off.
+- Disconnect: run it, then give them the link from its answer to switch the password (or OINOA's access) off.
 - Not connected and they ask about their mail: offer to connect it, or ask them to forward
   or paste the letter.
 - Calendars are not connected here. Yandex Calendar (and Bitrix24's) the person connects in
