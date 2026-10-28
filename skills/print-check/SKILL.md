@@ -30,13 +30,15 @@ what is wrong and the fix.
      size. Never make up a barcode number.
    - Dark bars on a light background (red bars do not scan), a clear margin on both sides,
      not cut by a fold or a seam, not shrunk below 80% of the nominal size (37.29 × 25.93 mm).
-   - A mandatory marking code (for example the DataMatrix of «Честный знак») comes from that
-     system. Leave its place and size as required; never draw or invent one.
+   - A mandatory marking code (for example Russia's «Честный знак» DataMatrix, or a GS1 DataMatrix a
+     retailer or an EU rule asks for) comes from that system. Leave its place and size as required;
+     never draw or invent one.
 3. **Text, every word.** Spelling, numbers, units (г, мл, %), the same name everywhere, the
    phone, the address and the website character by character. Read it twice: once as text,
    once backwards line by line, which stops the eye from filling in what it expects.
 4. **What the label must carry.** Ask which rules apply, or check them with **deep-research**
-   (for food sold in Russia and the EAEU: ТР ТС 022/2011). List each required item and where
+   (food sold in the EU: Regulation (EU) 1169/2011 and the languages each country requires; in Russia
+   and the EAEU: ТР ТС 022/2011). List each required item and where
    it is on the layout, or that it is missing. You check against the rule; the person and
    their lawyer decide.
 5. **Technical setup.** Bleed (usually 3 mm, or what the printer asks), nothing important
